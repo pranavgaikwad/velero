@@ -37,8 +37,7 @@ import (
 )
 
 const (
-	regionKey            = "region"
-	credentialProfileKey = "credProfile"
+	regionKey = "region"
 )
 
 // iopsVolumeTypes is a set of AWS EBS volume types for which IOPS should
