@@ -61,6 +61,21 @@ func getSession(config *aws.Config) (*session.Session, error) {
 	return sess, nil
 }
 
+// takes AWS credential profile and creates a new session
+func getSessionWithOptions(config *aws.Config, profile string) (*session.Session, error) {
+	sessionOptions := session.Options{Config: *config, Profile: profile}
+	sess, err := session.NewSessionWithOptions(sessionOptions)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	if _, err := sess.Config.Credentials.Get(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return sess, nil
+}
+
 func NewVolumeSnapshotter(logger logrus.FieldLogger) *VolumeSnapshotter {
 	return &VolumeSnapshotter{log: logger}
 }
