@@ -36,7 +36,10 @@ import (
 	"github.com/heptio/velero/pkg/cloudprovider"
 )
 
-const regionKey = "region"
+const (
+	regionKey            = "region"
+	credentialProfileKey = "credProfile"
+)
 
 // iopsVolumeTypes is a set of AWS EBS volume types for which IOPS should
 // be captured during snapshot and provided when creating a new volume
@@ -81,18 +84,19 @@ func NewVolumeSnapshotter(logger logrus.FieldLogger) *VolumeSnapshotter {
 }
 
 func (b *VolumeSnapshotter) Init(config map[string]string) error {
-	if err := cloudprovider.ValidateVolumeSnapshotterConfigKeys(config, regionKey); err != nil {
+	if err := cloudprovider.ValidateVolumeSnapshotterConfigKeys(config, regionKey, credentialProfileKey); err != nil {
 		return err
 	}
 
 	region := config[regionKey]
+	credentialProfile := config[credentialProfileKey]
 	if region == "" {
 		return errors.Errorf("missing %s in aws configuration", regionKey)
 	}
 
 	awsConfig := aws.NewConfig().WithRegion(region)
 
-	sess, err := getSession(awsConfig)
+	sess, err := getSessionWithOptions(awsConfig, credentialProfile)
 	if err != nil {
 		return err
 	}
