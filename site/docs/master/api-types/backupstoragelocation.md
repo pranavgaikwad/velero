@@ -20,7 +20,7 @@ spec:
     bucket: myBucket
   config:
     region: us-west-2
-    credProfile: credentialProfile
+    credProfile: "<profile-name>"
 ```
 
 ### Parameter Reference
