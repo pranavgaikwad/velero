@@ -42,7 +42,7 @@ const (
 	s3ForcePathStyleKey  = "s3ForcePathStyle"
 	bucketKey            = "bucket"
 	signatureVersionKey  = "signatureVersion"
-	credentialProfileKey = "credProfile"
+	credentialProfileKey = "profile"
 )
 
 type s3Interface interface {
@@ -82,7 +82,6 @@ func (o *ObjectStore) Init(config map[string]string) error {
 		kmsKeyIDKey,
 		s3ForcePathStyleKey,
 		signatureVersionKey,
-		credentialProfileKey,
 	); err != nil {
 		return err
 	}
@@ -127,7 +126,7 @@ func (o *ObjectStore) Init(config map[string]string) error {
 		return err
 	}
 
-	serverSession, err := getSessionWithOptions(serverConfig, credentialProfile)
+	serverSession, err := getSession(serverConfig, credentialProfile)
 	if err != nil {
 		return err
 	}
@@ -148,7 +147,7 @@ func (o *ObjectStore) Init(config map[string]string) error {
 		if err != nil {
 			return err
 		}
-		publicSession, err := getSessionWithOptions(publicConfig, credentialProfile)
+		publicSession, err := getSession(publicConfig, credentialProfile)
 		if err != nil {
 			return err
 		}
