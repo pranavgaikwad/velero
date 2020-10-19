@@ -39,6 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	kubeerrs "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -48,6 +49,7 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/archive"
 	"github.com/vmware-tanzu/velero/pkg/client"
 	"github.com/vmware-tanzu/velero/pkg/discovery"
+	velerov1client "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/typed/velero/v1"
 	listers "github.com/vmware-tanzu/velero/pkg/generated/listers/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/kuberesource"
 	"github.com/vmware-tanzu/velero/pkg/label"
@@ -86,6 +88,7 @@ type Restorer interface {
 
 // kubernetesRestorer implements Restorer for restoring into a Kubernetes cluster.
 type kubernetesRestorer struct {
+	restoreClient              velerov1client.RestoresGetter
 	discoveryHelper            discovery.Helper
 	dynamicFactory             client.DynamicFactory
 	namespaceClient            corev1.NamespaceInterface
@@ -100,6 +103,7 @@ type kubernetesRestorer struct {
 
 // NewKubernetesRestorer creates a new kubernetesRestorer.
 func NewKubernetesRestorer(
+	restoreClient velerov1client.RestoresGetter,
 	discoveryHelper discovery.Helper,
 	dynamicFactory client.DynamicFactory,
 	resourcePriorities []string,
@@ -110,6 +114,7 @@ func NewKubernetesRestorer(
 	logger logrus.FieldLogger,
 ) (Restorer, error) {
 	return &kubernetesRestorer{
+		restoreClient:              restoreClient,
 		discoveryHelper:            discoveryHelper,
 		dynamicFactory:             dynamicFactory,
 		namespaceClient:            namespaceClient,
@@ -223,6 +228,7 @@ func (kr *kubernetesRestorer) Restore(
 		pvRenamer:                  kr.pvRenamer,
 		discoveryHelper:            kr.discoveryHelper,
 		resourcePriorities:         kr.resourcePriorities,
+		restoreClient:              kr.restoreClient,
 	}
 
 	return restoreCtx.execute()
@@ -294,6 +300,7 @@ type context struct {
 	backupReader               io.Reader
 	restore                    *velerov1api.Restore
 	restoreDir                 string
+	restoreClient              velerov1client.RestoresGetter
 	resourceIncludesExcludes   *collections.IncludesExcludes
 	namespaceIncludesExcludes  *collections.IncludesExcludes
 	selector                   labels.Selector
@@ -355,102 +362,83 @@ func (ctx *context) execute() (Result, Result) {
 	// need to set this for additionalItems to be restored
 	ctx.restoreDir = dir
 
-	var (
-		existingNamespaces = sets.NewString()
-		processedResources = sets.NewString()
-	)
-
 	backupResources, err := archive.NewParser(ctx.log, ctx.fileSystem).Parse(ctx.restoreDir)
 	if err != nil {
 		errs.AddVeleroError(errors.Wrap(err, "error parsing backup contents"))
 		return warnings, errs
 	}
 
-	// Iterate through an ordered list of resources to restore, checking each one to see if it should be restored.
-	// Note that resources *may* be in this list twice, i.e. once due to being a prioritized resource, and once due
-	// to being in the backup tarball. We can't de-dupe this upfront, because it's possible that items in the prioritized
-	// resources list may not be fully resolved group-resource strings (e.g. may be specfied as "po" instead of "pods"),
-	// and we don't want to fully resolve them via discovery until we reach them in the loop, because it is possible
-	// that the resource/API itself is being restored via a custom resource definition, meaning it's not available via
-	// discovery prior to beginning the restore.
-	//
-	// Since we keep track of the fully-resolved group-resources that we *have* restored, we won't try to restore a
-	// resource twice even if it's in the ordered list twice.
-	for _, resource := range getOrderedResources(ctx.resourcePriorities, backupResources) {
-		// try to resolve the resource via discovery to a complete group/version/resource
-		gvr, _, err := ctx.discoveryHelper.ResourceFor(schema.ParseGroupResource(resource).WithVersion(""))
-		if err != nil {
-			ctx.log.WithField("resource", resource).Infof("Skipping restore of resource because it cannot be resolved via discovery")
-			continue
-		}
-		groupResource := gvr.GroupResource()
+	selectedResourceCollection, w, e := ctx.getOrderedResourceCollection(backupResources)
+	warnings.Merge(&w)
+	errs.Merge(&e)
 
-		// check if we've already restored this resource (this would happen if the resource
-		// we're currently looking at was already restored because it was a prioritized
-		// resource, and now we're looking at it as part of the backup contents).
-		if processedResources.Has(groupResource.String()) {
-			ctx.log.WithField("resource", groupResource.String()).Debugf("Skipping restore of resource because it's already been processed")
-			continue
-		}
+	type progressUpdate struct {
+		totalItems, itemsRestored int
+	}
 
-		// check if the resource should be restored according to the resource includes/excludes
-		if !ctx.resourceIncludesExcludes.ShouldInclude(groupResource.String()) {
-			ctx.log.WithField("resource", groupResource.String()).Infof("Skipping restore of resource because the restore spec excludes it")
-			continue
-		}
+	update := make(chan progressUpdate)
 
-		// we don't want to explicitly restore namespace API objs because we'll handle
-		// them as a special case prior to restoring anything into them
-		if groupResource == kuberesource.Namespaces {
-			continue
-		}
+	quit := make(chan struct{})
 
-		// check if the resource is present in the backup
-		resourceList := backupResources[groupResource.String()]
-		if resourceList == nil {
-			ctx.log.WithField("resource", groupResource.String()).Debugf("Skipping restore of resource because it's not present in the backup tarball")
-			continue
-		}
-
-		// iterate through each namespace that contains instances of the resource and
-		// restore them
-		for namespace, items := range resourceList.ItemsByNamespace {
-			if namespace != "" && !ctx.namespaceIncludesExcludes.ShouldInclude(namespace) {
-				ctx.log.Infof("Skipping namespace %s", namespace)
-				continue
-			}
-
-			// get target namespace to restore into, if different
-			// from source namespace
-			targetNamespace := namespace
-			if target, ok := ctx.restore.Spec.NamespaceMapping[namespace]; ok {
-				targetNamespace = target
-			}
-
-			// if we don't know whether this namespace exists yet, attempt to create
-			// it in order to ensure it exists. Try to get it from the backup tarball
-			// (in order to get any backed-up metadata), but if we don't find it there,
-			// create a blank one.
-			if namespace != "" && !existingNamespaces.Has(targetNamespace) {
-				logger := ctx.log.WithField("namespace", namespace)
-				ns := getNamespace(logger, getItemFilePath(ctx.restoreDir, "namespaces", "", namespace), targetNamespace)
-				if _, err := kube.EnsureNamespaceExistsAndIsReady(ns, ctx.namespaceClient, ctx.resourceTerminatingTimeout); err != nil {
-					errs.AddVeleroError(err)
-					continue
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		var lastUpdate *progressUpdate
+		for {
+			select {
+			case <-quit:
+				ticker.Stop()
+				return
+			case val := <-update:
+				lastUpdate = &val
+			case <-ticker.C:
+				if lastUpdate != nil {
+					patch := fmt.Sprintf(`{"status":{"progress":{"totalItems":%d,"itemsRestored":%d}}}`, lastUpdate.totalItems, lastUpdate.itemsRestored)
+					if _, err := ctx.restoreClient.Restores(ctx.restore.Namespace).Patch(ctx.restore.Name, types.MergePatchType, []byte(patch)); err != nil {
+						ctx.log.WithError(errors.WithStack((err))).Warn("Got error trying to update restore's status.progress")
+					}
+					lastUpdate = nil
 				}
-
-				// keep track of namespaces that we know exist so we don't
-				// have to try to create them multiple times
-				existingNamespaces.Insert(targetNamespace)
 			}
-
-			w, e := ctx.restoreResource(groupResource.String(), targetNamespace, namespace, items)
-			warnings.Merge(&w)
-			errs.Merge(&e)
 		}
+	}()
 
-		// record that we've restored the resource
-		processedResources.Insert(groupResource.String())
+	totalItems, i, existingNamespaces := 0, 0, sets.NewString()
+
+	for _, selectedResource := range selectedResourceCollection {
+		totalItems += selectedResource.totalItems
+	}
+	for _, selectedResource := range selectedResourceCollection {
+		groupResource := schema.ParseGroupResource(selectedResource.resource)
+
+		for namespace, selectedItems := range selectedResource.selectedItemsByNamespace {
+			for _, selectedItem := range selectedItems {
+				// if we don't know whether this namespace exists yet, attempt to create
+				// it in order to ensure it exists. Try to get it from the backup tarball
+				// (in order to get any backed-up metadata), but if we don't find it there,
+				// create a blank one.
+				if namespace != "" && !existingNamespaces.Has(selectedItem.targetNamespace) {
+					logger := ctx.log.WithField("namespace", namespace)
+					ns := getNamespace(logger, getItemFilePath(ctx.restoreDir, "namespaces", "", namespace), selectedItem.targetNamespace)
+					if _, err := kube.EnsureNamespaceExistsAndIsReady(ns, ctx.namespaceClient, ctx.resourceTerminatingTimeout); err != nil {
+						errs.AddVeleroError(err)
+						continue
+					}
+
+					// keep track of namespaces that we know exist so we don't
+					// have to try to create them multiple times
+					existingNamespaces.Insert(selectedItem.targetNamespace)
+				}
+				w, e := ctx.restoreItem(selectedItem.obj, groupResource, selectedItem.targetNamespace)
+				actualTotalItems := len(ctx.restoredItems) + (totalItems - (i + 1))
+				i++
+				update <- progressUpdate{
+					totalItems:    actualTotalItems,
+					itemsRestored: len(ctx.restoredItems),
+				}
+				warnings.Merge(&w)
+				errs.Merge(&e)
+			}
+		}
 
 		// if we just restored custom resource definitions (CRDs), refresh discovery
 		// because the restored CRDs may have created new APIs that didn't previously
@@ -461,6 +449,15 @@ func (ctx *context) execute() (Result, Result) {
 				warnings.Add("", errors.Wrap(err, "error refreshing discovery after restoring custom resource definitions"))
 			}
 		}
+	}
+
+	// close the progress update channel
+	quit <- struct{}{}
+
+	// do a final progress update as stopping the ticker might have left last few updates from taking place
+	patch := fmt.Sprintf(`{"status":{"progress":{"totalItems":%d,"itemsRestored":%d}}}`, len(ctx.restoredItems), len(ctx.restoredItems))
+	if _, err := ctx.restoreClient.Restores(ctx.restore.Namespace).Patch(ctx.restore.Name, types.MergePatchType, []byte(patch)); err != nil {
+		ctx.log.WithError(errors.WithStack((err))).Warn("Got error trying to update restore's status.progress")
 	}
 
 	// wait for all of the restic restore goroutines to be done, which is
@@ -1351,3 +1348,144 @@ func (ctx *context) unmarshal(filePath string) (*unstructured.Unstructured, erro
 
 	return &obj, nil
 }
+
+type restoreResource struct {
+	resource                 string
+	selectedItemsByNamespace map[string][]restoreItem
+	totalItems               int
+}
+
+type restoreItem struct {
+	obj             *unstructured.Unstructured
+	targetNamespace string
+	name            string
+}
+
+func (ctx *context) getOrderedResourceCollection(backupResources map[string]*archive.ResourceItems) (restoreResourceCollection []restoreResource, warnings Result, errs Result) {
+	processedResources := sets.NewString()
+	// Iterate through an ordered list of resources to restore, checking each one to see if it should be restored.
+	// Note that resources *may* be in this list twice, i.e. once due to being a prioritized resource, and once due
+	// to being in the backup tarball. We can't de-dupe this upfront, because it's possible that items in the prioritized
+	// resources list may not be fully resolved group-resource strings (e.g. may be specfied as "po" instead of "pods"),
+	// and we don't want to fully resolve them via discovery until we reach them in the loop, because it is possible
+	// that the resource/API itself is being restored via a custom resource definition, meaning it's not available via
+	// discovery prior to beginning the restore.
+	//
+	// Since we keep track of the fully-resolved group-resources that we *have* restored, we won't try to restore a
+	// resource twice even if it's in the ordered list twice.
+	for _, resource := range getOrderedResources(ctx.resourcePriorities, backupResources) {
+		// try to resolve the resource via discovery to a complete group/version/resource
+		gvr, _, err := ctx.discoveryHelper.ResourceFor(schema.ParseGroupResource(resource).WithVersion(""))
+		if err != nil {
+			ctx.log.WithField("resource", resource).Infof("Skipping restore of resource because it cannot be resolved via discovery")
+			continue
+		}
+		groupResource := gvr.GroupResource()
+
+		// check if we've already restored this resource (this would happen if the resource
+		// we're currently looking at was already restored because it was a prioritized
+		// resource, and now we're looking at it as part of the backup contents).
+		if processedResources.Has(groupResource.String()) {
+			ctx.log.WithField("resource", groupResource.String()).Debugf("Skipping restore of resource because it's already been processed")
+			continue
+		}
+
+		// check if the resource should be restored according to the resource includes/excludes
+		if !ctx.resourceIncludesExcludes.ShouldInclude(groupResource.String()) {
+			ctx.log.WithField("resource", groupResource.String()).Infof("Skipping restore of resource because the restore spec excludes it")
+			continue
+		}
+
+		// we don't want to explicitly restore namespace API objs because we'll handle
+		// them as a special case prior to restoring anything into them
+		if groupResource == kuberesource.Namespaces {
+			continue
+		}
+
+		// check if the resource is present in the backup
+		resourceList := backupResources[groupResource.String()]
+		if resourceList == nil {
+			ctx.log.WithField("resource", groupResource.String()).Debugf("Skipping restore of resource because it's not present in the backup tarball")
+			continue
+		}
+
+		// iterate through each namespace that contains instances of the resource and
+		// restore them
+		for namespace, items := range resourceList.ItemsByNamespace {
+			if namespace != "" && !ctx.namespaceIncludesExcludes.ShouldInclude(namespace) {
+				ctx.log.Infof("Skipping namespace %s", namespace)
+				continue
+			}
+
+			// get target namespace to restore into, if different
+			// from source namespace
+			targetNamespace := namespace
+			if target, ok := ctx.restore.Spec.NamespaceMapping[namespace]; ok {
+				targetNamespace = target
+			}
+
+			res, w, e := ctx.getSelectedResourceItems(groupResource.String(), targetNamespace, namespace, items)
+			restoreResourceCollection = append(restoreResourceCollection, res)
+
+			warnings.Merge(&w)
+			errs.Merge(&e)
+		}
+
+		// record that we've restored the resource
+		processedResources.Insert(groupResource.String())
+	}
+	return
+}
+
+func (ctx *context) getSelectedResourceItems(resource, targetNamespace, originalNamespace string, items []string) (res restoreResource, warnings Result, errs Result) {
+	res.resource = resource
+	if res.selectedItemsByNamespace == nil {
+		res.selectedItemsByNamespace = make(map[string][]restoreItem)
+	}
+	if targetNamespace == "" && boolptr.IsSetToFalse(ctx.restore.Spec.IncludeClusterResources) {
+		ctx.log.Infof("Skipping resource %s because it's cluster-scoped", resource)
+		return
+	}
+
+	if targetNamespace == "" && !boolptr.IsSetToTrue(ctx.restore.Spec.IncludeClusterResources) && !ctx.namespaceIncludesExcludes.IncludeEverything() {
+		ctx.log.Infof("Skipping resource %s because it's cluster-scoped and only specific namespaces are included in the restore", resource)
+		return
+	}
+
+	if targetNamespace != "" {
+		ctx.log.Infof("Resource '%s' will be restored into namespace '%s'", resource, targetNamespace)
+	} else {
+		ctx.log.Infof("Resource '%s' will be restored at cluster scope", resource)
+	}
+
+	if len(items) == 0 {
+		return
+	}
+
+	for _, item := range items {
+		itemPath := getItemFilePath(ctx.restoreDir, resource, originalNamespace, item)
+
+		obj, err := ctx.unmarshal(itemPath)
+		if err != nil {
+			errs.Add(targetNamespace, fmt.Errorf("error decoding %q: %v", strings.Replace(itemPath, ctx.restoreDir+"/", "", -1), err))
+			continue
+		}
+
+		if !ctx.selector.Matches(labels.Set(obj.GetLabels())) {
+			continue
+		}
+
+		selectedItem := restoreItem{
+			obj:             obj,
+			name:            item,
+			targetNamespace: targetNamespace,
+		}
+		res.selectedItemsByNamespace[originalNamespace] = append(res.selectedItemsByNamespace[originalNamespace], selectedItem)
+		res.totalItems++
+	}
+	return
+}
+
+/*
+
+ */
